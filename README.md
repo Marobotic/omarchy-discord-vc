@@ -3,6 +3,8 @@
 Live Discord voice-call status in the Omarchy bar. It appears when you join a
 call and hides itself again when you leave.
 
+![The widget in the Omarchy bar](preview.png)
+
 ```
 ◉ Alice 󰍭
 │  │     └─ shown only while you are muted or deafened
