@@ -6,9 +6,9 @@ import qs.Ui
 
 // Discord voice-call status for the Omarchy bar.
 //
-//   ◉ Alice 󰍭
-//   │  │     └─ shown only while you are muted or deafened
-//   │  └─────── whoever is talking; your own name when the channel is quiet
+//   ◉ Maro 󰍭
+//   │  │    └─ your muted/deafened warning, shown only beside your own name
+//   │  └────── whoever is talking; your own name when the channel is quiet
 //   └────────── fill is the call ping (white→amber→red); a green ring means
 //               live audio, yours included, per Discord's own voice detection
 //
@@ -133,6 +133,15 @@ BarWidget {
   // be heard, and is absent the rest of the time.
   readonly property bool inputMuted: connected && fresh
     && (state.mute === true || state.deaf === true)
+
+  // ...but it is *your* state sitting next to a label that names whoever is
+  // talking, so beside someone else's name it reads as "they are muted".
+  // Show it only when the label is your own, or when no label is rendered
+  // at all and there is nothing to misread.
+  readonly property bool labelIsSelf: String(state.speaker || "") === ""
+    && !(root.silentShows === "last" && String(state.lastSpeaker || ""))
+  readonly property bool nameShown: root.showName && !root.vertical
+    && root.speakerLabel !== ""
 
   readonly property string micGlyph: state.deaf === true ? "󰟎" : "󰍭"
 
@@ -296,6 +305,7 @@ BarWidget {
       Text {
         anchors.verticalCenter: parent.verticalCenter
         visible: root.showMic && root.inputMuted
+                 && (root.labelIsSelf || !root.nameShown)
         text: root.micGlyph
         textFormat: Text.PlainText
         renderType: Text.NativeRendering

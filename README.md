@@ -6,9 +6,9 @@ call and hides itself again when you leave.
 ![The widget in the Omarchy bar](preview.png)
 
 ```
-◉ Alice 󰍭
-│  │     └─ shown only while you are muted or deafened
-│  └─────── who is talking right now (your own name when it is quiet)
+◉ Maro 󰍭
+│  │    └─ your muted/deafened warning, shown only beside your own name
+│  └────── who is talking right now (your own name when it is quiet)
 └────────── fill is the call ping (white → amber → red);
             a green ring means live audio in the channel
 ```
@@ -141,6 +141,13 @@ doubles as "Discord is hearing me".
 The mic glyph is only a warning: it appears when you are muted (`󰍭`) or
 deafened (`󰟎`) and is absent otherwise, so an unremarkable call shows just a
 dot and a name.
+
+It is deliberately hidden while somebody else is talking. The glyph describes
+*your* microphone, but it sits beside a label that names whoever is
+transmitting — so next to another person's name it would read as "they are
+muted". It returns as soon as the channel is quiet and the label is your own
+name again. (With `showName` off, or on a vertical bar, there is no name to
+misread and the glyph is always shown while you are muted.)
 
 ### What lands on disk
 
