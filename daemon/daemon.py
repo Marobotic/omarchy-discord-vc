@@ -89,7 +89,7 @@ class Session:
         self.ping = None
         self.avg_ping = None
 
-        self.members = {}          # user_id -> display name
+        self.members = {}          # user_id -> {"name", "mute", "deaf"}
         self.speaking = set()      # user ids currently transmitting
         self.last_speaker_id = ""
         self.last_speaker_name = ""
@@ -108,11 +108,28 @@ class Session:
                 or user.get("username")
                 or "someone")
 
+    @classmethod
+    def _member(cls, voice_state):
+        """Reduce an RPC voice-state object to what the widget renders.
+
+        Muted covers every way someone can end up unheard: muting themselves,
+        a server mute, and stage/AFK suppression. Deafened covers self and
+        server deafen. The top-level "mute" -- *you* muting them locally -- is
+        deliberately ignored: it is your setting, not their state.
+        """
+        vs = voice_state.get("voice_state") or {}
+        return {
+            "name": cls._display_name(voice_state),
+            "mute": bool(vs.get("self_mute") or vs.get("mute")
+                         or vs.get("suppress")),
+            "deaf": bool(vs.get("self_deaf") or vs.get("deaf")),
+        }
+
     def name_for(self, user_id):
         user_id = str(user_id)
         if user_id == self.self_id:
             return self.self_name
-        return self.members.get(user_id, "")
+        return (self.members.get(user_id) or {}).get("name", "")
 
     # -- channel tracking ---------------------------------------------------
 
@@ -185,7 +202,7 @@ class Session:
             user = vs.get("user") or {}
             uid = str(user.get("id") or "")
             if uid:
-                self.members[uid] = self._display_name(vs)
+                self.members[uid] = self._member(vs)
 
     def refresh_channel(self):
         try:
@@ -249,7 +266,7 @@ class Session:
             user = data.get("user") or {}
             uid = str(user.get("id") or "")
             if uid:
-                self.members[uid] = self._display_name(data)
+                self.members[uid] = self._member(data)
 
         elif evt == "VOICE_STATE_DELETE":
             user = data.get("user") or {}
@@ -274,6 +291,7 @@ class Session:
         return {
             "ok": True,
             "needsAuth": False,
+            "members": self.roster() if connected else [],
             "connected": connected,
             "live": live,
             "state": self.conn_state,
@@ -291,6 +309,30 @@ class Session:
             "deaf": self.deaf,
         }
 
+    def roster(self):
+        """Everyone in the channel, alphabetical, for the widget's panel.
+
+        Order is by name rather than by activity so rows never jump around
+        while people talk. Your own row takes its mute/deafen from voice
+        settings, which update the instant you toggle them, rather than from
+        the voice-state echo that follows.
+        """
+        people = dict(self.members)
+        if self.self_id:
+            me = dict(people.get(self.self_id) or {"name": self.self_name})
+            me.update(mute=self.mute, deaf=self.deaf)
+            people[self.self_id] = me
+        rows = [{
+            "id": uid,
+            "name": m.get("name") or "someone",
+            "self": uid == self.self_id,
+            "speaking": uid in self.speaking,
+            "mute": bool(m.get("mute")),
+            "deaf": bool(m.get("deaf")),
+        } for uid, m in people.items()]
+        rows.sort(key=lambda r: r["name"].casefold())
+        return rows
+
     def publish(self, force=False):
         self.pub.write(self.snapshot(), force=force)
 
@@ -299,6 +341,7 @@ def offline_payload(reason, needs_auth=False):
     return {
         "ok": False,
         "needsAuth": needs_auth,
+        "members": [],
         "connected": False,
         "live": False,
         "state": "OFFLINE",

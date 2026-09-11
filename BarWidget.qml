@@ -12,6 +12,10 @@ import qs.Ui
 //   └────────── fill is the call ping (white→amber→red); a green ring means
 //               live audio, yours included, per Discord's own voice detection
 //
+// Clicks: left opens the roster panel (Panel.qml) -- everyone in the
+// channel, with the same speaking ring and their mute/deafen state; right
+// focuses the Discord window; middle restarts the daemon.
+//
 // Everything is read from the state file the companion daemon publishes at
 // $XDG_RUNTIME_DIR/omarchy-discord-vc.json. The daemon owns all Discord RPC
 // traffic; this widget only renders what it finds, so a dead daemon degrades
@@ -240,20 +244,64 @@ BarWidget {
     action.running = true
   }
 
+  // ---- roster panel. Bar.findPanelWidget routes summon/hide/toggle and
+  //      click-to-switch between bar popups through open/close/opened on the
+  //      bar-widget root, so those forward to the loaded Panel.qml.
+  readonly property bool opened: panelLoader.item
+    ? panelLoader.item.opened === true : false
+  readonly property bool popoutSwitchClosing: panelLoader.item
+    ? panelLoader.item.popoutSwitchClosing === true : false
+
+  function open() { if (panelLoader.item) panelLoader.item.open() }
+  function close() { if (panelLoader.item) panelLoader.item.close() }
+  function closeForPopoutSwitch() {
+    if (panelLoader.item) panelLoader.item.closeForPopoutSwitch()
+  }
+
+  function togglePanel() {
+    if (!panelLoader.item) return
+    // The hover tooltip is already up from the pointer entering the widget;
+    // drop it so it doesn't sit on top of the panel that is about to open.
+    if (root.bar && root.bar.hideTooltip) root.bar.hideTooltip(button)
+    panelLoader.item.toggle()
+  }
+
+  function injectPanel() {
+    var target = panelLoader.item
+    if (!target) return
+    target.bar = root.bar
+    target.anchorItem = button
+    target.hostWidget = root
+  }
+
+  Loader {
+    id: panelLoader
+    active: true
+    source: Qt.resolvedUrl("Panel.qml")
+    visible: false
+    onLoaded: {
+      root.injectPanel()
+      // bar can still be null on the first pass; inject again once the
+      // widget has been fully attached.
+      Qt.callLater(root.injectPanel)
+    }
+  }
+
   WidgetButton {
     id: button
     anchors.fill: parent
     bar: root.bar
     labelVisible: false
     hasVisualContent: true
-    tooltipText: root.tooltipText
+    tooltipText: root.opened ? "" : root.tooltipText
     fixedWidth: root.vertical ? -1 : content.implicitWidth + scaledHorizontalMargin * 2
     fixedHeight: root.vertical ? content.implicitHeight + scaledVerticalPadding * 2 : -1
 
     onPressed: function (b) {
       if (root.needsAuth) { root.runAuth(); return }
       if (b === Qt.MiddleButton) root.restartDaemon()
-      else root.focusDiscord()
+      else if (b === Qt.RightButton) root.focusDiscord()
+      else root.togglePanel()
     }
 
     Row {

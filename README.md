@@ -13,6 +13,23 @@ call and hides itself again when you leave.
             a green ring means live audio in the channel
 ```
 
+Click it for everyone in the call: each person gets the same speaking ring,
+plus whether they are muted or deafened.
+
+```
+GENERAL
+MY SERVER · 3 IN CALL
+─────────────────────
+◉ Alice          󰍬      ring = talking right now
+● Maro (you)     󰍭      󰍬 can be heard · 󰍭 muted · 󰟎 deafened
+● zed            󰟎
+```
+
+Your own row's dot is the bar's ping colour; everyone else's is neutral,
+because Discord only reports your own connection. Rows are alphabetical, so
+nobody jumps around the list while they talk. Click anywhere outside the panel,
+or press Escape, to close it.
+
 Hovering shows the server and channel, the exact ping and its rolling average,
 the voice endpoint you are routed through, and who is speaking. Resting states
 — silence, an open mic — are deliberately left out, so a hover only ever tells
@@ -134,7 +151,7 @@ Subscribed events:
 | `VOICE_CHANNEL_SELECT` | joining and leaving a channel |
 | `VOICE_SETTINGS_UPDATE` | mute / deafen |
 | `SPEAKING_START` / `SPEAKING_STOP` | who is transmitting, including you |
-| `VOICE_STATE_*` | the member roster, to turn user ids into names |
+| `VOICE_STATE_*` | the member roster — names, and each person's mute/deafen state |
 
 The green ring is driven by `SPEAKING_START` / `SPEAKING_STOP` for everyone in
 the channel *including you*. That is Discord's own decision about who is
@@ -159,7 +176,7 @@ misread and the glyph is always shown while you are muted.)
 
 | Path | Contents |
 |---|---|
-| `$XDG_RUNTIME_DIR/omarchy-discord-vc.json` | current server, channel, ping, and the display names of people in your call |
+| `$XDG_RUNTIME_DIR/omarchy-discord-vc.json` | current server, channel, ping, and the display names and mute/deafen state of people in your call |
 | `~/.local/state/omarchy-discord-vc/token.json` | the access token, mode `0600` in a `0700` directory |
 | `~/.config/systemd/user/omarchy-discord-vc.service` | the user service |
 
@@ -198,7 +215,8 @@ Per-widget overrides go in the widget's entry in `~/.config/omarchy/shell.json`:
 
 ## Clicks
 
-- **Left** — focus the Discord window (or start authorization when unconfigured)
+- **Left** — open the list of people in the call (or start authorization when unconfigured)
+- **Right** — focus the Discord window
 - **Middle** — restart the daemon
 
 ## Troubleshooting
