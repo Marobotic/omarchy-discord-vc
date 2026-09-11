@@ -38,6 +38,9 @@ def state_dir():
     base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
     path = os.path.join(base, "omarchy-discord-vc")
     os.makedirs(path, mode=0o700, exist_ok=True)
+    # makedirs' mode only applies when it creates the directory; tighten one
+    # that already existed with looser permissions.
+    os.chmod(path, stat.S_IRWXU)
     return path
 
 
@@ -58,9 +61,17 @@ def load_token():
 def save_token(token, client_id):
     path = token_path()
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
+    # Create the file 0600 from the start rather than chmod-ing after the
+    # write, so the token never exists in a file with umask permissions.
+    # O_NOFOLLOW refuses to write through a symlink left at the temp path.
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 stat.S_IRUSR | stat.S_IWUSR)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump({"access_token": token, "client_id": client_id}, fh)
-    os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
     os.replace(tmp, path)
     return path
 
