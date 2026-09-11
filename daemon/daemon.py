@@ -34,6 +34,16 @@ CONNECTED_STATES = {
 }
 LIVE_STATES = {"VOICE_CONNECTED", "CONNECTED"}
 
+# Everything below is sized by what the peer sends, so each has a ceiling.
+# A voice channel holds 99 people; the headroom covers stage audiences, and
+# a single 1 MiB roster frame could not describe many more than this anyway.
+MAX_MEMBERS = 1000
+# Guild names are looked up per guild id and cached; only a few are ever live.
+MAX_GUILD_NAMES = 16
+# An unknown speaker triggers a roster resync, at most this often, so a burst
+# of events cannot turn into a burst of requests.
+ROSTER_RESYNC_SECONDS = 2.0
+
 
 def state_file():
     base = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
@@ -97,6 +107,7 @@ class Session:
         self.mute = False
         self.deaf = False
         self._guild_names = {}
+        self._last_resync = float("-inf")
 
     # -- naming -------------------------------------------------------------
 
@@ -165,6 +176,8 @@ class Session:
             name = data.get("name") or ""
         except (RPCError, TimeoutError):
             name = ""
+        if len(self._guild_names) >= MAX_GUILD_NAMES:
+            self._guild_names.clear()
         self._guild_names[guild_id] = name
         return name
 
@@ -198,7 +211,7 @@ class Session:
         self.guild_id = channel.get("guild_id")
         self.guild_name = self._guild_name(self.guild_id)
         self.members = {}
-        for vs in channel.get("voice_states") or []:
+        for vs in (channel.get("voice_states") or [])[:MAX_MEMBERS]:
             user = vs.get("user") or {}
             uid = str(user.get("id") or "")
             if uid:
@@ -250,14 +263,21 @@ class Session:
         elif evt == "SPEAKING_START":
             uid = str(data.get("user_id") or "")
             if uid:
-                self.speaking.add(uid)
                 name = self.name_for(uid)
                 if not name:
-                    # A member we have not seen yet -- resync the roster.
-                    self.refresh_channel()
-                    name = self.name_for(uid) or "someone"
-                self.last_speaker_id = uid
-                self.last_speaker_name = name
+                    # A member we have not seen yet -- resync the roster, but
+                    # not more than once per ROSTER_RESYNC_SECONDS.
+                    now = time.monotonic()
+                    if now - self._last_resync >= ROSTER_RESYNC_SECONDS:
+                        self._last_resync = now
+                        self.refresh_channel()
+                        name = self.name_for(uid)
+                # Only people in the roster are tracked, so the speaking set
+                # is bounded by it rather than by whatever ids arrive.
+                if name:
+                    self.speaking.add(uid)
+                    self.last_speaker_id = uid
+                    self.last_speaker_name = name
 
         elif evt == "SPEAKING_STOP":
             self.speaking.discard(str(data.get("user_id") or ""))
@@ -265,7 +285,7 @@ class Session:
         elif evt in ("VOICE_STATE_CREATE", "VOICE_STATE_UPDATE"):
             user = data.get("user") or {}
             uid = str(user.get("id") or "")
-            if uid:
+            if uid and (uid in self.members or len(self.members) < MAX_MEMBERS):
                 self.members[uid] = self._member(data)
 
         elif evt == "VOICE_STATE_DELETE":

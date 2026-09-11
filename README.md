@@ -103,6 +103,13 @@ the daemon asks the kernel for the peer's uid (`SO_PEERCRED`) before
 authenticating. World-writable `/tmp` is never searched, so another local user
 cannot stand up a fake Discord socket to collect the token.
 
+Even the genuine peer is not trusted to behave. Every wait on the socket has an
+absolute deadline, a frame must finish arriving (or sending) within a few
+seconds once it starts, and anything buffered — pending events, roster
+members, cached names — is capped. A peer that floods, stalls, or trickles is
+disconnected, and the daemon reconnects, rather than being able to hang it or
+grow its memory.
+
 Tokens expire after a while. When that happens the widget falls back to a red
 dot reading `setup`; run `auth` again.
 
