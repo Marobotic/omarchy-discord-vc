@@ -15,6 +15,7 @@ import json
 import os
 import select
 import socket
+import stat
 import struct
 import uuid
 
@@ -23,6 +24,12 @@ OP_FRAME = 1
 OP_CLOSE = 2
 OP_PING = 3
 OP_PONG = 4
+
+# Upper bound on one frame's payload. The length field is a uint32 the peer
+# controls, so without a cap a single header could make us try to buffer 4 GiB.
+# Real frames are far smaller -- a full voice channel's roster is tens of KiB --
+# and an oversized one is treated as a broken connection, not data.
+MAX_FRAME = 1 << 20
 
 # Discord Streamkit's public application. It is whitelisted by Discord for the
 # rpc / rpc.voice.read scopes, which is what lets a local overlay read voice
@@ -40,17 +47,43 @@ class Closed(RPCError):
 
 
 def socket_paths():
-    """Candidate IPC socket paths, in the order Discord itself probes them."""
+    """Candidate IPC socket paths, in the order Discord itself probes them.
+
+    Only locations inside the per-user runtime directory are searched. Discord
+    will also fall back to /tmp when it has no runtime directory, but /tmp is
+    world-writable: any local user could park a fake discord-ipc socket there
+    and collect the access token we authenticate with. Every candidate is also
+    checked in connect() -- see _verify_peer().
+    """
     base = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
     roots = [
         base,
         os.path.join(base, "app", "com.discordapp.Discord"),
         os.path.join(base, "snap.discord"),
-        "/tmp",
     ]
     for root in roots:
         for i in range(10):
             yield os.path.join(root, f"discord-ipc-{i}")
+
+
+def _verify_peer(path, sock):
+    """Refuse a socket unless we own it and our own uid is serving it.
+
+    The file check rejects a socket someone else created; SO_PEERCRED then
+    asks the kernel which uid is on the far end of the connection, which a
+    planted or swapped socket cannot fake. Both must match before any
+    credentials cross the wire.
+    """
+    st = os.lstat(path)
+    if not stat.S_ISSOCK(st.st_mode):
+        raise RPCError(f"{path} is not a socket")
+    if st.st_uid != os.getuid():
+        raise RPCError(f"{path} is owned by uid {st.st_uid}, not us")
+    creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                            struct.calcsize("3i"))
+    _pid, uid, _gid = struct.unpack("3i", creds)
+    if uid != os.getuid():
+        raise RPCError(f"{path} is served by uid {uid}, not us")
 
 
 class RPC:
@@ -72,7 +105,8 @@ class RPC:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
                 s.connect(path)
-            except OSError as exc:
+                _verify_peer(path, s)
+            except (OSError, RPCError) as exc:
                 last = exc
                 s.close()
                 continue
@@ -128,21 +162,27 @@ class RPC:
             r, _, _ = select.select([self.sock], [], [], timeout)
             return bool(r)
 
-        if not ready():
-            return None
-        header = self._read_exact(8, lambda: True)
-        op, length = struct.unpack("<II", header)
-        body = self._read_exact(length, lambda: True) if length else b"{}"
-        try:
-            payload = json.loads(body)
-        except ValueError as exc:
-            raise RPCError(f"bad json frame: {exc}") from exc
-        if op == OP_PING:
-            self._send(OP_PONG, payload)
-            return self.read_frame(timeout)
-        if op == OP_CLOSE:
-            raise Closed(f"discord closed the connection: {payload}")
-        return op, payload
+        # A loop rather than recursion for PING: the peer decides how many
+        # PINGs arrive in a row, so it must not decide our stack depth.
+        while True:
+            if not ready():
+                return None
+            header = self._read_exact(8, lambda: True)
+            op, length = struct.unpack("<II", header)
+            if length > MAX_FRAME:
+                raise Closed(f"frame of {length} bytes exceeds the "
+                             f"{MAX_FRAME}-byte limit")
+            body = self._read_exact(length, lambda: True) if length else b"{}"
+            try:
+                payload = json.loads(body)
+            except ValueError as exc:
+                raise RPCError(f"bad json frame: {exc}") from exc
+            if op == OP_PING:
+                self._send(OP_PONG, payload)
+                continue
+            if op == OP_CLOSE:
+                raise Closed(f"discord closed the connection: {payload}")
+            return op, payload
 
     # -- protocol -----------------------------------------------------------
 

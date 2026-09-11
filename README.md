@@ -80,6 +80,12 @@ The requested scopes are `rpc` and `rpc.voice.read` — **read-only voice
 state**. The token cannot send messages, join or leave calls, or change
 anything about your account.
 
+The token is only ever sent to a Discord socket inside your own runtime
+directory that is owned by you **and** served by a process running as you —
+the daemon asks the kernel for the peer's uid (`SO_PEERCRED`) before
+authenticating. World-writable `/tmp` is never searched, so another local user
+cannot stand up a fake Discord socket to collect the token.
+
 Tokens expire after a while. When that happens the widget falls back to a red
 dot reading `setup`; run `auth` again.
 

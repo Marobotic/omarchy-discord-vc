@@ -37,8 +37,9 @@ die() { echo "omarchy-discord-vc: $*" >&2; exit 1; }
 # Snap, Vesktop, canary and PTB -- which a process-name check does not.
 discord_socket_present() {
   local root
+  # Same locations the daemon trusts -- never world-writable /tmp.
   for root in "$RUNTIME" "$RUNTIME/app/com.discordapp.Discord" \
-              "$RUNTIME/snap.discord" /tmp; do
+              "$RUNTIME/snap.discord"; do
     for i in {0..9}; do
       [[ -S "$root/discord-ipc-$i" ]] && return 0
     done
