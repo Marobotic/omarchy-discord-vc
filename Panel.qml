@@ -3,14 +3,17 @@ import Quickshell
 import qs.Commons
 import qs.Ui
 
-// Voice-channel roster for the Discord VC widget.
+// Call details and voice-channel roster for the Discord VC widget.
 //
+//   My Server
 //   GENERAL
-//   MY SERVER · 3 IN CALL
 //   ─────────────────────
 //   ◉ Alice          󰍬
 //   ● Maro (you)     󰍭
 //   ● zed            󰟎
+//   ─────────────────────
+//   Voice server  rotterdam1234.discord.media
+//   Ping          42 ms · avg 45
 //
 // Each row carries the same circle as the bar: a green ring while that person
 // is transmitting. Your own row's fill is the bar dot's ping colour, since the
@@ -38,20 +41,44 @@ Panel {
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
+  // The Discord server is the headline; a DM or group call has none.
   readonly property string titleText: {
     if (!inCall) return "Discord VC"
-    return String(hostState.channel || "") || "Voice channel"
+    return String(hostState.guild || "") || "Direct call"
   }
 
   readonly property string captionText: {
     if (!inCall) return "Not in a voice call"
-    var parts = []
-    var guild = String(hostState.guild || "")
-    if (guild) parts.push(guild)
-    var n = members.length
-    parts.push(n === 1 ? "1 in call" : n + " in call")
-    return parts.join(" · ")
+    return String(hostState.channel || "") || "Voice channel"
   }
+
+  readonly property int ping: hostWidget ? hostWidget.ping : -1
+
+  readonly property string pingText: {
+    if (!inCall) return ""
+    if (ping < 0) return "— (" + String(hostState.state || "connecting").toLowerCase() + ")"
+    var text = ping + " ms"
+    var avg = hostState.avgPing
+    if (typeof avg === "number" && avg >= 0) text += " · avg " + avg
+    return text
+  }
+
+  // Same thresholds as the bar dot, but "fast" is plain foreground text
+  // rather than the dot's white, which would vanish on a light theme.
+  readonly property color pingColor: {
+    if (!hostWidget || ping < 0) return dim
+    if (ping <= hostWidget.goodPing) return foreground
+    if (ping <= hostWidget.okPing) return hostWidget.okColor
+    return Color.urgent
+  }
+
+  // Every voice host ends in .discord.media; the part before it (region
+  // code and node) is the informative bit, and fits the card.
+  readonly property string hostText: inCall
+    ? String(hostState.hostname || "").replace(/\.discord\.media$/, "") : ""
+
+  // Offline, unauthorized or stale: say why, since there is no tooltip.
+  readonly property string reasonText: hostWidget ? hostWidget.offlineReason : ""
 
   // Route Tab-switching through the host widget, which is what the bar
   // registered -- this Panel is an implementation detail behind it.
@@ -68,7 +95,7 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: popup.fittedContentWidth(Style.space(280))
+    contentWidth: popup.fittedContentWidth(Style.space(320))
     contentHeight: popup.fittedContentHeight(column.implicitHeight, Style.space(480))
 
     PanelKeyCatcher {
@@ -121,6 +148,17 @@ Panel {
             }
           }
 
+          Text {
+            width: parent.width
+            visible: !root.inCall && root.reasonText !== ""
+            text: root.reasonText
+            textFormat: Text.PlainText
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            wrapMode: Text.Wrap
+          }
+
           PanelSeparator {
             visible: root.members.length > 0
             foreground: root.foreground
@@ -140,8 +178,65 @@ Panel {
               }
             }
           }
+
+          PanelSeparator {
+            visible: root.inCall
+            foreground: root.foreground
+          }
+
+          Column {
+            width: parent.width
+            visible: root.inCall
+            spacing: Style.space(4)
+
+            DetailRow {
+              label: "Voice server"
+              value: root.hostText || "—"
+            }
+            DetailRow {
+              label: "Ping"
+              value: root.pingText
+              valueColor: root.pingColor
+            }
+          }
         }
       }
+    }
+  }
+
+  component DetailRow: Item {
+    id: detail
+
+    property string label: ""
+    property string value: ""
+    property color valueColor: root.foreground
+
+    width: column.width
+    implicitHeight: Math.max(labelText.implicitHeight, valueText.implicitHeight)
+
+    Text {
+      id: labelText
+      anchors.left: parent.left
+      anchors.verticalCenter: parent.verticalCenter
+      width: Style.space(96)
+      text: detail.label
+      textFormat: Text.PlainText
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+
+    Text {
+      id: valueText
+      anchors.left: labelText.right
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      text: detail.value
+      textFormat: Text.PlainText
+      color: detail.valueColor
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+      elide: Text.ElideRight
     }
   }
 

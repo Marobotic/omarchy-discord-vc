@@ -13,16 +13,20 @@ call and hides itself again when you leave.
             a green ring means live audio in the channel
 ```
 
-Click it for everyone in the call: each person gets the same speaking ring,
-plus whether they are muted or deafened.
+Click it for the call details: the server and channel you are in, everyone
+in the call with the same speaking ring plus whether they are muted or
+deafened, and the voice server you are routed through with your exact ping.
 
 ```
+My Server
 GENERAL
-MY SERVER · 3 IN CALL
 ─────────────────────
 ◉ Alice          󰍬      ring = talking right now
 ● Maro (you)     󰍭      󰍬 can be heard · 󰍭 muted · 󰟎 deafened
 ● zed            󰟎
+─────────────────────
+Voice server  c-ord06-ee4aeeb5
+Ping          42 ms · avg 45
 ```
 
 Your own row's dot is the bar's ping colour; everyone else's is neutral,
@@ -30,10 +34,9 @@ because Discord only reports your own connection. Rows are alphabetical, so
 nobody jumps around the list while they talk. Click anywhere outside the panel,
 or press Escape, to close it.
 
-Hovering shows the server and channel, the exact ping and its rolling average,
-the voice endpoint you are routed through, and who is speaking. Resting states
-— silence, an open mic — are deliberately left out, so a hover only ever tells
-you something.
+There is no hover tooltip: nothing pops up just from moving the pointer
+across the bar. When the daemon is offline or needs authorization, the panel
+says why.
 
 ## Requirements
 
@@ -62,6 +65,16 @@ Then install the background service and authorize once:
 `install` writes a **user** systemd unit to
 `~/.config/systemd/user/omarchy-discord-vc.service` and enables it. It touches
 nothing else — no system units, no `/etc`, no existing config of yours.
+
+Before writing the unit, `install` checks that everything it will run can only
+have been put there by root or by you: `/usr/bin/python3` (called by absolute
+path, never via `PATH` or `/usr/bin/env`) and every directory above it must be
+root-owned and not writable by others, and the plugin's daemon directory and
+modules must be owned by you or root, not group/other-writable, and reached
+without symlinks. The unit runs Python in isolated mode (`-I`), pins `PATH`,
+strips the dynamic-loader variables, and is sandboxed to unix sockets only
+(`RestrictAddressFamilies=AF_UNIX`, `NoNewPrivileges`, `MemoryDenyWriteExecute`
+and friends). The helper script itself calls every tool by absolute path.
 
 To get the shorter command name, put it on your `PATH` once:
 
@@ -96,6 +109,15 @@ yields a code that is exchanged for an access token stored at
 The requested scopes are `rpc` and `rpc.voice.read` — **read-only voice
 state**. The token cannot send messages, join or leave calls, or change
 anything about your account.
+
+The token file is handled without trusting pathnames: the state directory is
+opened one component at a time with `O_NOFOLLOW`, each component must be owned
+by root or you and not writable by anyone else (so it can never live under
+`/tmp`), and the final directory is forced to `0700` through its own
+descriptor. The token is read only if it is a regular file you own, `0600` or
+tighter and a few KiB at most, and written under a random temp name with
+`O_EXCL | O_NOFOLLOW`, then renamed into place relative to that directory. The
+runtime state file is written the same way.
 
 The token is only ever sent to a Discord socket inside your own runtime
 directory that is owned by you **and** served by a process running as you —
@@ -215,14 +237,14 @@ Per-widget overrides go in the widget's entry in `~/.config/omarchy/shell.json`:
 | `goodPing` | `98` | ms at or below which the dot is white |
 | `okPing` | `301` | ms at or below which the dot is amber; above it, red |
 | `silentShows` | `"self"` | label when nobody is talking — `"self"` for your own name, `"last"` to keep the last speaker |
-| `maxNameLength` | `14` | characters before a name is elided |
+| `maxNameLength` | `24` | characters before a name is elided |
 | `showName` | `true` | show the speaker label at all |
 | `showMic` | `true` | show the muted/deafened glyph at all |
 | `showWhenIdle` | `false` | keep a dim widget visible when not in a call |
 
 ## Clicks
 
-- **Left** — open the list of people in the call (or start authorization when unconfigured)
+- **Left** — open the call panel: server, channel, people, voice server and ping (or start authorization when unconfigured)
 - **Right** — focus the Discord window
 - **Middle** — restart the daemon
 
@@ -234,6 +256,12 @@ it, or run `omarchy-discord-vc auth`.
 **Nothing in the bar at all** — either you are not in a call (that is the
 normal resting state; set `showWhenIdle` to `true` if you want it visible
 anyway) or the daemon is not publishing. Check `omarchy-discord-vc log`.
+
+**Two Discord clients open at once** (say, Discord and Vesktop) — each binds
+its own `discord-ipc-N` socket, and the second may accept connections without
+ever answering. The daemon skips a socket that stops responding for a minute
+and moves on to the next one, so the widget stays on whichever client is
+actually working.
 
 **`no Discord IPC socket found`** — the Discord client is not running, or it
 is a sandboxed build that puts its socket somewhere unusual. `ls

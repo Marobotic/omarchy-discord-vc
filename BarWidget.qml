@@ -12,9 +12,11 @@ import qs.Ui
 //   └────────── fill is the call ping (white→amber→red); a green ring means
 //               live audio, yours included, per Discord's own voice detection
 //
-// Clicks: left opens the roster panel (Panel.qml) -- everyone in the
-// channel, with the same speaking ring and their mute/deafen state; right
-// focuses the Discord window; middle restarts the daemon.
+// Clicks: left opens the panel (Panel.qml) -- the server and channel you are
+// in, your ping, and everyone in the channel with the same speaking ring and
+// their mute/deafen state; right focuses the Discord window; middle restarts
+// the daemon. There is deliberately no hover tooltip: details are one click
+// away and never pop up just from moving the pointer across the bar.
 //
 // Everything is read from the state file the companion daemon publishes at
 // $XDG_RUNTIME_DIR/omarchy-discord-vc.json. The daemon owns all Discord RPC
@@ -31,7 +33,7 @@ import qs.Ui
 //   goodPing      ms at or under which the dot is white          (default 98)
 //   okPing        ms at or under which the dot is amber         (default 301)
 //   silentShows   "self" | "last" -- label when nobody is talking (default "self")
-//   maxNameLength characters before the name is elided           (default 14)
+//   maxNameLength characters before the name is elided           (default 24)
 //   showName      show the speaker label                       (default true)
 //   showMic       show the muted-mic glyph while muted         (default true)
 //   showWhenIdle  keep a dim widget when not in a call        (default false)
@@ -48,7 +50,7 @@ BarWidget {
 
   Process {
     id: uidProbe
-    command: ["id", "-u"]
+    command: ["/usr/bin/id", "-u"]
     running: root.runtimeDir === ""
     stdout: StdioCollector {
       onStreamFinished: {
@@ -61,15 +63,23 @@ BarWidget {
   // The helper ships inside the plugin, so call it by its own path rather
   // than trusting ~/.local/bin to be on the shell session's PATH.
   readonly property string cli: {
-    var dir = Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "")
+    // resolvedUrl is percent-encoded; decode it back to the real path.
+    var dir = decodeURIComponent(Qt.resolvedUrl(".").toString().replace(/^file:\/\//, ""))
     return dir.replace(/\/$/, "") + "/bin/omarchy-discord-vc"
+  }
+
+  // Omarchy's own commands live outside /usr/bin; call them by path rather
+  // than through whatever PATH the shell session happens to have.
+  readonly property string omarchyBin: {
+    var base = Quickshell.env("OMARCHY_PATH") || ""
+    return (base.charAt(0) === "/" ? base : "/usr/share/omarchy") + "/bin"
   }
 
   // Settings, resolved once per change rather than per binding evaluation.
   readonly property int goodPing: setting("goodPing", 98)
   readonly property int okPing: setting("okPing", 301)
   readonly property string silentShows: setting("silentShows", "self")
-  readonly property int maxNameLength: setting("maxNameLength", 14)
+  readonly property int maxNameLength: setting("maxNameLength", 24)
   readonly property bool showName: setting("showName", true)
   readonly property bool showMic: setting("showMic", true)
   readonly property bool showWhenIdle: setting("showWhenIdle", false)
@@ -121,6 +131,41 @@ BarWidget {
     return truncate(String(state.self || ""))
   }
 
+  // The label keeps a fixed width so the bar slot never re-sizes as different
+  // people talk. The width is measured from the longest name actually in the
+  // call, so names like "Ultranova Violet" fit uncut, and elide only rescues
+  // someone absurd joining afterwards.
+  readonly property string widestName: {
+    var names = []
+    var members = state.members
+    if (Array.isArray(members)) {
+      for (var i = 0; i < members.length; i++)
+        names.push(String((members[i] || {}).name || ""))
+    }
+    var selfName = String(state.self || "")
+    if (selfName) names.push(selfName)
+    var speakerName = String(state.speaker || "")
+    if (speakerName) names.push(speakerName)
+    var lastName = String(state.lastSpeaker || "")
+    if (lastName) names.push(lastName)
+    names.push("setup")
+
+    var worst = ""
+    for (var j = 0; j < names.length; j++) {
+      var n = root.truncate(names[j])
+      if (n.length > worst.length) worst = n
+    }
+    return worst
+  }
+
+  TextMetrics {
+    id: nameMetrics
+    font: nameLabel.font
+    text: root.widestName
+  }
+
+  readonly property real labelWidth: Math.max(24, nameMetrics.advanceWidth)
+
   // Ping fill runs white (fast) → amber → red. The ring keeps its own green
   // so the two signals never read as the same colour.
   readonly property color fastColor: "#ffffff"
@@ -149,46 +194,13 @@ BarWidget {
 
   readonly property string micGlyph: state.deaf === true ? "󰟎" : "󰍭"
 
-  readonly property string tooltipText: {
-    if (needsAuth)
-      return "Discord VC — not authorized\n"
-        + "Click to authorize, or run:\n"
-        + "  omarchy-discord-vc auth"
-    if (!daemonOk || !fresh) {
-      var reason = String(state.reason || "daemon not running")
-      return "Discord VC — offline\n" + reason
-        + "\nMiddle click to restart the daemon"
-    }
-    if (!connected) return "Discord — not in a voice call"
-
-    var lines = []
-    var where = String(state.guild || "")
-    var channel = String(state.channel || "")
-    if (where && channel) lines.push(where + " · " + channel)
-    else if (channel) lines.push(channel)
-    else if (where) lines.push(where)
-
-    if (ping >= 0) {
-      var line = "Ping " + ping + " ms"
-      var avg = state.avgPing
-      if (typeof avg === "number" && avg >= 0) line += " (avg " + avg + " ms)"
-      lines.push(line)
-    } else {
-      lines.push("Ping — (" + String(state.state || "connecting") + ")")
-    }
-
-    var host = String(state.hostname || "")
-    if (host) lines.push("Voice server " + host)
-
-    // Only states worth reading are listed. Silence and an open mic are the
-    // resting case, and saying so every hover is noise.
-    var speaking = String(state.speaker || "")
-    if (speaking) lines.push("Speaking: " + speaking)
-
-    if (state.deaf === true) lines.push("Deafened")
-    else if (state.mute === true) lines.push("Muted")
-
-    return lines.join("\n")
+  // Why the widget is not showing a call, for the panel to explain.
+  readonly property string offlineReason: {
+    if (needsAuth) return "Not authorized — click the widget to authorize"
+    if (!daemonOk || !fresh)
+      return String(state.reason || "daemon not running")
+        + " — middle click to restart"
+    return ""
   }
 
   visible: needsAuth || connected || (root.showWhenIdle && daemonOk)
@@ -227,10 +239,12 @@ BarWidget {
 
   // Authorization is interactive -- Discord shows a modal and the helper
   // prints what it is doing -- so it needs a visible terminal, not a silent
-  // background process.
+  // background process. The launcher runs its argument through `bash -c`,
+  // so the path is shell-quoted: a home directory with spaces or shell
+  // metacharacters must stay one literal word.
   function runAuth() {
-    action.command = ["omarchy-launch-floating-terminal-with-presentation",
-                      root.cli + " auth"]
+    action.command = [root.omarchyBin + "/omarchy-launch-floating-terminal-with-presentation",
+                      Util.shellQuote(root.cli) + " auth"]
     action.running = true
   }
 
@@ -240,7 +254,7 @@ BarWidget {
   }
 
   function focusDiscord() {
-    action.command = ["hyprctl", "dispatch", "focuswindow", "class:discord"]
+    action.command = ["/usr/bin/hyprctl", "dispatch", "focuswindow", "class:discord"]
     action.running = true
   }
 
@@ -260,9 +274,6 @@ BarWidget {
 
   function togglePanel() {
     if (!panelLoader.item) return
-    // The hover tooltip is already up from the pointer entering the widget;
-    // drop it so it doesn't sit on top of the panel that is about to open.
-    if (root.bar && root.bar.hideTooltip) root.bar.hideTooltip(button)
     panelLoader.item.toggle()
   }
 
@@ -293,7 +304,7 @@ BarWidget {
     bar: root.bar
     labelVisible: false
     hasVisualContent: true
-    tooltipText: root.opened ? "" : root.tooltipText
+    tooltipText: ""
     fixedWidth: root.vertical ? -1 : content.implicitWidth + scaledHorizontalMargin * 2
     fixedHeight: root.vertical ? content.implicitHeight + scaledVerticalPadding * 2 : -1
 
@@ -336,9 +347,13 @@ BarWidget {
       }
 
       Text {
+        id: nameLabel
         anchors.verticalCenter: parent.verticalCenter
         visible: root.showName && text !== "" && !root.vertical
         text: root.speakerLabel
+        width: root.labelWidth
+        elide: Text.ElideRight
+        horizontalAlignment: Text.AlignLeft
         textFormat: Text.PlainText
         renderType: Text.NativeRendering
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
