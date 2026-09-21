@@ -21,7 +21,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from auth import load_token  # noqa: E402
-from rpc import RPC, Closed, RPCError  # noqa: E402
+from rpc import RPC, Closed, RPCError, _obj, _str  # noqa: E402
+from safefs import open_runtime_dir, write_file_atomic  # noqa: E402
 
 RECONNECT_DELAY = 3.0
 # Republish at least this often so the widget can tell a live daemon from a
@@ -45,18 +46,51 @@ MAX_GUILD_NAMES = 16
 ROSTER_RESYNC_SECONDS = 2.0
 
 
-def state_file():
-    base = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
-    return os.path.join(base, "omarchy-discord-vc.json")
+STATE_NAME = "omarchy-discord-vc.json"
+
+
+def _id(value):
+    """A Discord snowflake as a string. Ids are digit strings; nothing else is one."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        value = str(value)
+    return (value if isinstance(value, str) and value.isascii() and value.isdigit()
+            and len(value) <= 20 else "")
+
+
+def _ms(value):
+    """A ping in whole milliseconds, or None for anything not a sane number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not 0 <= value < 600_000:
+        return None
+    return int(value)
 
 
 class Publisher:
-    """Atomically writes the widget's state file, skipping no-op writes."""
+    """Atomically writes the widget's state file, skipping no-op writes.
+
+    The file is written relative to a descriptor for the runtime directory,
+    opened once through open_runtime_dir() (ours, 0700, no symlinks), and
+    re-opened only after a failed write.
+    """
 
     def __init__(self):
-        self.path = state_file()
+        self._dir_fd = None
         self._last_payload = None
         self._last_write = 0.0
+
+    def _dir(self):
+        if self._dir_fd is None:
+            self._dir_fd = open_runtime_dir()
+        return self._dir_fd
+
+    def _reset_dir(self):
+        if self._dir_fd is not None:
+            try:
+                os.close(self._dir_fd)
+            except OSError:
+                pass
+            self._dir_fd = None
 
     def write(self, payload, force=False):
         now = time.time()
@@ -68,16 +102,12 @@ class Publisher:
         self._last_payload = comparable
         self._last_write = now
         payload = dict(payload, updated=int(now))
-        tmp = f"{self.path}.{os.getpid()}.tmp"
         try:
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh)
-            os.replace(tmp, self.path)
+            write_file_atomic(self._dir(), STATE_NAME,
+                              json.dumps(payload).encode("utf-8"), mode=0o600)
         except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            # Retry from a fresh directory descriptor on the next write.
+            self._reset_dir()
 
 
 class Session:
@@ -86,9 +116,10 @@ class Session:
     def __init__(self, rpc, publisher):
         self.rpc = rpc
         self.pub = publisher
-        self.self_id = str((rpc.user or {}).get("id") or "")
-        self.self_name = ((rpc.user or {}).get("global_name")
-                          or (rpc.user or {}).get("username") or "me")
+        user = _obj(rpc.user)
+        self.self_id = _id(user.get("id"))
+        self.self_name = (_str(user.get("global_name"))
+                          or _str(user.get("username")) or "me")
 
         self.channel_id = None
         self.channel_name = ""
@@ -113,10 +144,10 @@ class Session:
 
     @staticmethod
     def _display_name(voice_state):
-        user = voice_state.get("user") or {}
-        return (voice_state.get("nick")
-                or user.get("global_name")
-                or user.get("username")
+        user = _obj(voice_state.get("user"))
+        return (_str(voice_state.get("nick"))
+                or _str(user.get("global_name"))
+                or _str(user.get("username"))
                 or "someone")
 
     @classmethod
@@ -128,7 +159,7 @@ class Session:
         server deafen. The top-level "mute" -- *you* muting them locally -- is
         deliberately ignored: it is your setting, not their state.
         """
-        vs = voice_state.get("voice_state") or {}
+        vs = _obj(voice_state.get("voice_state"))
         return {
             "name": cls._display_name(voice_state),
             "mute": bool(vs.get("self_mute") or vs.get("mute")
@@ -173,7 +204,7 @@ class Session:
         try:
             data = self.rpc.request("GET_GUILD", {"guild_id": guild_id},
                                     timeout=8.0)
-            name = data.get("name") or ""
+            name = _str(data.get("name"))
         except (RPCError, TimeoutError):
             name = ""
         if len(self._guild_names) >= MAX_GUILD_NAMES:
@@ -183,6 +214,7 @@ class Session:
 
     def load_channel(self, channel):
         """Adopt the channel returned by GET_SELECTED_VOICE_CHANNEL."""
+        channel = _obj(channel)
         if not channel:
             if self.channel_id:
                 self._unsubscribe_channel(self.channel_id)
@@ -196,7 +228,7 @@ class Session:
             self.last_speaker_name = ""
             return
 
-        channel_id = str(channel.get("id") or "")
+        channel_id = _id(channel.get("id"))
         if channel_id != self.channel_id:
             if self.channel_id:
                 self._unsubscribe_channel(self.channel_id)
@@ -207,13 +239,15 @@ class Session:
             if channel_id:
                 self._subscribe_channel(channel_id)
 
-        self.channel_name = channel.get("name") or ""
-        self.guild_id = channel.get("guild_id")
+        self.channel_name = _str(channel.get("name"))
+        self.guild_id = _id(channel.get("guild_id")) or None
         self.guild_name = self._guild_name(self.guild_id)
         self.members = {}
-        for vs in (channel.get("voice_states") or [])[:MAX_MEMBERS]:
-            user = vs.get("user") or {}
-            uid = str(user.get("id") or "")
+        states = channel.get("voice_states")
+        for vs in (states if isinstance(states, list) else [])[:MAX_MEMBERS]:
+            vs = _obj(vs)
+            user = _obj(vs.get("user"))
+            uid = _id(user.get("id"))
             if uid:
                 self.members[uid] = self._member(vs)
 
@@ -237,15 +271,13 @@ class Session:
 
     def handle(self, payload):
         evt = payload.get("evt")
-        data = payload.get("data") or {}
+        data = _obj(payload.get("data"))
 
         if evt == "VOICE_CONNECTION_STATUS":
-            self.conn_state = data.get("state") or "DISCONNECTED"
-            self.hostname = data.get("hostname") or ""
-            last = data.get("last_ping")
-            avg = data.get("average_ping")
-            self.ping = int(last) if isinstance(last, (int, float)) else None
-            self.avg_ping = int(avg) if isinstance(avg, (int, float)) else None
+            self.conn_state = _str(data.get("state")) or "DISCONNECTED"
+            self.hostname = _str(data.get("hostname"))
+            self.ping = _ms(data.get("last_ping"))
+            self.avg_ping = _ms(data.get("average_ping"))
             if self.conn_state not in CONNECTED_STATES:
                 self.speaking.clear()
 
@@ -261,7 +293,7 @@ class Session:
             self.deaf = bool(data.get("deaf"))
 
         elif evt == "SPEAKING_START":
-            uid = str(data.get("user_id") or "")
+            uid = _id(data.get("user_id"))
             if uid:
                 name = self.name_for(uid)
                 if not name:
@@ -280,17 +312,17 @@ class Session:
                     self.last_speaker_name = name
 
         elif evt == "SPEAKING_STOP":
-            self.speaking.discard(str(data.get("user_id") or ""))
+            self.speaking.discard(_id(data.get("user_id")))
 
         elif evt in ("VOICE_STATE_CREATE", "VOICE_STATE_UPDATE"):
-            user = data.get("user") or {}
-            uid = str(user.get("id") or "")
+            user = _obj(data.get("user"))
+            uid = _id(user.get("id"))
             if uid and (uid in self.members or len(self.members) < MAX_MEMBERS):
                 self.members[uid] = self._member(data)
 
         elif evt == "VOICE_STATE_DELETE":
-            user = data.get("user") or {}
-            uid = str(user.get("id") or "")
+            user = _obj(data.get("user"))
+            uid = _id(user.get("id"))
             self.members.pop(uid, None)
             self.speaking.discard(uid)
 
@@ -394,6 +426,9 @@ def run_once(pub):
         rpc.connect()
         rpc.handshake()
     except (Closed, RPCError, TimeoutError, OSError) as exc:
+        # A socket that accepted us but never answered is a bad peer, not a
+        # dead end: blacklist it so the next attempt uses another client.
+        rpc.mark_bad(str(exc))
         pub.write(offline_payload(f"discord unavailable: {exc}"))
         rpc.close()
         time.sleep(RECONNECT_DELAY)
@@ -402,12 +437,18 @@ def run_once(pub):
     try:
         rpc.authenticate(token)
     except RPCError as exc:
+        # An explicit rejection (bad token, wrong scopes) is the token's
+        # fault, not the socket's: report it without blacklisting the peer.
         pub.write(offline_payload(f"authorization rejected: {exc}",
                                   needs_auth=True))
         rpc.close()
         time.sleep(RECONNECT_DELAY * 3)
         return
     except (Closed, TimeoutError, OSError) as exc:
+        # The peer answered the handshake but never answered AUTHENTICATE
+        # (or dropped mid-flight). Blacklist it so the next attempt lands on
+        # another client instead of hanging on the same socket forever.
+        rpc.mark_bad(str(exc))
         pub.write(offline_payload(f"discord unavailable: {exc}"))
         rpc.close()
         time.sleep(RECONNECT_DELAY)

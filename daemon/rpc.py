@@ -20,6 +20,8 @@ import struct
 import time
 import uuid
 
+from safefs import open_runtime_dir, runtime_dir_path
+
 OP_HANDSHAKE = 0
 OP_FRAME = 1
 OP_CLOSE = 2
@@ -55,6 +57,24 @@ MAX_PENDING_BYTES = 1 << 20
 # people who would rather use their own app (see auth.py).
 DEFAULT_CLIENT_ID = "207646673902501888"
 
+# Sockets that connected and handshook but never answered a command (a second
+# Discord client hijacking the low IPC paths is the common cause). They are
+# skipped for a grace period so one wedged peer cannot hold the daemon hostage
+# on every reconnect, but not banned forever: a socket that recovers is probed
+# again once its entry expires.
+BAD_PATH_GRACE_SECONDS = 60.0
+_bad_paths = {}  # path -> time.monotonic() when it was marked
+
+
+def _active_bad_paths():
+    """Sockets currently under the bad grace period, pruning expired ones."""
+    now = time.monotonic()
+    stale = [path for path, marked in _bad_paths.items()
+             if now - marked >= BAD_PATH_GRACE_SECONDS]
+    for path in stale:
+        del _bad_paths[path]
+    return set(_bad_paths)
+
 
 class RPCError(Exception):
     pass
@@ -67,13 +87,14 @@ class Closed(RPCError):
 def socket_paths():
     """Candidate IPC socket paths, in the order Discord itself probes them.
 
-    Only locations inside the per-user runtime directory are searched. Discord
+    Only locations inside the per-user runtime directory are searched, and
+    connect() refuses that directory unless it is ours and mode 0700. Discord
     will also fall back to /tmp when it has no runtime directory, but /tmp is
     world-writable: any local user could park a fake discord-ipc socket there
     and collect the access token we authenticate with. Every candidate is also
     checked in connect() -- see _verify_peer().
     """
-    base = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    base = runtime_dir_path()
     roots = [
         base,
         os.path.join(base, "app", "com.discordapp.Discord"),
@@ -104,6 +125,25 @@ def _verify_peer(path, sock):
         raise RPCError(f"{path} is served by uid {uid}, not us")
 
 
+def _reject_constant(name):
+    """NaN and Infinity are not JSON; Python accepts them unless told not to."""
+    raise ValueError(f"non-standard JSON constant {name}")
+
+
+def _str(value):
+    """`value` if it is a string, else empty -- for fields we display or compare."""
+    return value if isinstance(value, str) else ""
+
+
+def _obj(value):
+    """`value` if it is a JSON object, else an empty one.
+
+    Everything the peer sends is shape-checked before it is indexed, so a
+    malformed frame is ignored instead of raising somewhere unexpected.
+    """
+    return value if isinstance(value, dict) else {}
+
+
 def _deadline(timeout):
     return None if timeout is None else time.monotonic() + timeout
 
@@ -116,6 +156,7 @@ class RPC:
     def __init__(self, client_id=DEFAULT_CLIENT_ID):
         self.client_id = client_id
         self.sock = None
+        self.path = None
         self.user = None
         # Events that arrive while we are blocked waiting on a command
         # reply, as (payload, size) pairs, bounded by MAX_PENDING_*.
@@ -125,9 +166,16 @@ class RPC:
     # -- connection ---------------------------------------------------------
 
     def connect(self):
+        # The runtime directory must be ours and closed to other users before
+        # any socket in it is considered at all.
+        try:
+            os.close(open_runtime_dir())
+        except OSError as exc:
+            raise Closed(f"runtime directory refused: {exc}") from exc
         last = None
+        bad = _active_bad_paths()
         for path in socket_paths():
-            if not os.path.exists(path):
+            if not os.path.exists(path) or path in bad:
                 continue
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             # Bounded even here: connect() on a unix socket blocks while the
@@ -144,6 +192,7 @@ class RPC:
             # explicit deadline; nothing is left to block on the socket itself.
             s.setblocking(False)
             self.sock = s
+            self.path = path
             self._pending_events = []
             self._pending_bytes = 0
             return path
@@ -155,6 +204,19 @@ class RPC:
                 self.sock.close()
             finally:
                 self.sock = None
+
+    def mark_bad(self, reason):
+        """Remember the connected socket as unresponsive and give it up.
+
+        Called after a peer accepts a connection and handshakes but then fails
+        to answer a command. The path is skipped on reconnects for a grace
+        period, so the daemon falls through to the next Discord client instead
+        of retrying a peer that hangs on every attempt.
+        """
+        path = self.path
+        if path:
+            _bad_paths[path] = time.monotonic()
+        self.close()
 
     # -- framing ------------------------------------------------------------
 
@@ -237,8 +299,8 @@ class RPC:
                                  f"{MAX_FRAME}-byte limit")
             body = self._read_exact(length, within) if length else b"{}"
             try:
-                payload = json.loads(body)
-            except ValueError as exc:
+                payload = json.loads(body, parse_constant=_reject_constant)
+            except (ValueError, RecursionError) as exc:
                 raise self._drop(f"bad json frame: {exc}") from exc
             if not isinstance(payload, dict):
                 raise self._drop("frame payload is not a JSON object")
@@ -283,7 +345,7 @@ class RPC:
                 self._park(payload, size)
                 continue
             if payload.get("evt") == "ERROR":
-                data = payload.get("data") or {}
+                data = _obj(payload.get("data"))
                 raise RPCError(
                     f"{what}: {data.get('message', 'unknown')} "
                     f"(code {data.get('code')})"
@@ -299,15 +361,20 @@ class RPC:
             raise TimeoutError("handshake timed out")
         _, payload = frame
         if payload.get("evt") != "READY":
-            raise RPCError(f"unexpected handshake reply: {payload}")
-        self.user = (payload.get("data") or {}).get("user") or {}
+            raise RPCError(f"unexpected handshake reply: {payload.get('evt')!r}")
+        data = payload.get("data")
+        user = data.get("user") if isinstance(data, dict) else None
+        self.user = user if isinstance(user, dict) else {}
         return self.user
 
     def request(self, cmd, args=None, timeout=10.0):
         """Send a command and wait for the reply with the matching nonce."""
         nonce = str(uuid.uuid4())
         self._send(OP_FRAME, {"cmd": cmd, "args": args or {}, "nonce": nonce})
-        return self._await_reply(nonce, cmd, timeout).get("data") or {}
+        data = self._await_reply(nonce, cmd, timeout).get("data")
+        # Callers index the reply as an object; anything else is treated as
+        # empty rather than trusted to have the expected shape.
+        return data if isinstance(data, dict) else {}
 
     def authenticate(self, access_token, timeout=10.0):
         return self.request("AUTHENTICATE", {"access_token": access_token},

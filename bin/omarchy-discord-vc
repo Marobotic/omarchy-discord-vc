@@ -12,25 +12,38 @@
 
 set -euo pipefail
 
+# Never resolve a command through the caller's PATH: every tool below is
+# called by its absolute path, and PATH is pinned for anything they spawn.
+PATH=/usr/bin
+export PATH
+PYTHON=/usr/bin/python3
+SYSTEMCTL=/usr/bin/systemctl
+JOURNALCTL=/usr/bin/journalctl
+# -I: isolated mode -- ignore PYTHON* variables and user site-packages.
+# -B: do not write bytecode into the plugin directory.
+py() { "$PYTHON" -I -B "$@"; }
+
 # Resolve the plugin directory from this script's own location rather than
 # assuming an install path. The script works from the plugin checkout, from a
 # symlink in ~/.local/bin, and from anywhere else it is called.
 SELF="${BASH_SOURCE[0]}"
+hops=0
 while [[ -L "$SELF" ]]; do
-  target="$(readlink "$SELF")"
-  [[ "$target" == /* ]] && SELF="$target" || SELF="$(dirname "$SELF")/$target"
+  (( ++hops <= 40 )) || { echo "omarchy-discord-vc: symlink loop at $SELF" >&2; exit 1; }
+  target="$(/usr/bin/readlink "$SELF")"
+  [[ "$target" == /* ]] && SELF="$target" || SELF="$(/usr/bin/dirname "$SELF")/$target"
 done
-PLUGIN_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+PLUGIN_DIR="$(cd "$(/usr/bin/dirname "$SELF")/.." && pwd -P)"
 
 DAEMON_DIR="$PLUGIN_DIR/daemon"
 UNIT="omarchy-discord-vc"
-UNIT_DIR="$HOME/.config/systemd/user"
-RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(/usr/bin/id -u)}"
 STATE_FILE="$RUNTIME/omarchy-discord-vc.json"
 
 die() { echo "omarchy-discord-vc: $*" >&2; exit 1; }
 
 [[ -d "$DAEMON_DIR" ]] || die "daemon not found at $DAEMON_DIR"
+[[ -x "$PYTHON" ]] || die "$PYTHON is required but not installed"
 
 # Discord's local RPC socket is the only thing that actually matters, and
 # looking for it covers every packaging of the client -- native, Flatpak,
@@ -55,46 +68,33 @@ case "$cmd" in
     # The authorization prompt appears inside Discord, so it has to be up.
     discord_socket_present \
       || die "no Discord IPC socket found -- is the Discord desktop client running?"
-    python3 "$DAEMON_DIR/auth.py" "$@"
+    py "$DAEMON_DIR/auth.py" "$@"
     # Pick the new token up immediately if the service is already running.
-    if systemctl --user is-active --quiet "$UNIT"; then
-      systemctl --user restart "$UNIT"
+    if "$SYSTEMCTL" --user is-active --quiet "$UNIT"; then
+      "$SYSTEMCTL" --user restart "$UNIT"
     fi
     ;;
 
   install)
-    command -v python3 >/dev/null || die "python3 is required but not installed"
-    mkdir -p "$UNIT_DIR"
-    cat > "$UNIT_DIR/$UNIT.service" <<EOF
-[Unit]
-Description=Discord voice state publisher for the Omarchy bar
-After=graphical-session.target
-PartOf=graphical-session.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/env python3 $DAEMON_DIR/daemon.py
-Restart=always
-RestartSec=3
-# The daemon only reads Discord's RPC socket and writes one runtime file.
-NoNewPrivileges=yes
-PrivateTmp=no
-
-[Install]
-WantedBy=graphical-session.target
-EOF
-    systemctl --user daemon-reload
-    systemctl --user enable --now "$UNIT"
+    # service.py vets the interpreter and the daemon code, then writes the
+    # unit atomically without following symlinks (see its docstring).
+    py "$DAEMON_DIR/service.py" write-unit >/dev/null \
+      || die "not installing the service"
+    "$SYSTEMCTL" --user daemon-reload
+    "$SYSTEMCTL" --user enable "$UNIT"
+    # restart, not start: re-running install after an update must replace a
+    # daemon that is still running the old code.
+    "$SYSTEMCTL" --user restart "$UNIT"
     echo "installed and started $UNIT"
     echo
     echo "Next: omarchy-discord-vc auth"
     ;;
 
   uninstall)
-    systemctl --user disable --now "$UNIT" 2>/dev/null || true
-    rm -f "$UNIT_DIR/$UNIT.service"
-    systemctl --user daemon-reload
-    rm -f "$STATE_FILE"
+    "$SYSTEMCTL" --user disable --now "$UNIT" 2>/dev/null || true
+    py "$DAEMON_DIR/service.py" remove-unit
+    "$SYSTEMCTL" --user daemon-reload
+    /usr/bin/rm -f -- "$STATE_FILE"
     echo "removed $UNIT"
     echo "the access token is still at ${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-discord-vc/"
     echo "delete that directory to revoke it locally, and remove the app at"
@@ -102,27 +102,29 @@ EOF
     ;;
 
   start|stop|restart)
-    systemctl --user "$cmd" "$UNIT"
+    "$SYSTEMCTL" --user "$cmd" "$UNIT"
     ;;
 
   status)
-    systemctl --user status "$UNIT" --no-pager || true
+    "$SYSTEMCTL" --user status "$UNIT" --no-pager || true
     ;;
 
   log)
-    journalctl --user -u "$UNIT" -n "${1:-50}" --no-pager
+    lines="${1:-50}"
+    [[ "$lines" =~ ^[0-9]{1,6}$ ]] || die "log takes a line count"
+    "$JOURNALCTL" --user -u "$UNIT" -n "$lines" --no-pager
     ;;
 
   state)
     [[ -f "$STATE_FILE" ]] || die "no state file at $STATE_FILE"
-    python3 -m json.tool "$STATE_FILE"
+    py -m json.tool "$STATE_FILE"
     ;;
 
   run)
-    exec python3 "$DAEMON_DIR/daemon.py"
+    exec "$PYTHON" -I -B "$DAEMON_DIR/daemon.py"
     ;;
 
   *)
-    sed -n '2,12p' "$SELF" | sed 's/^# \{0,1\}//'
+    /usr/bin/sed -n '2,12p' "$SELF" | /usr/bin/sed 's/^# \{0,1\}//'
     ;;
 esac

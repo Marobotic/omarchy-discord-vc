@@ -20,12 +20,16 @@ Two modes:
 
 import json
 import os
-import stat
 import sys
 import urllib.error
 import urllib.request
 
-from rpc import RPC, DEFAULT_CLIENT_ID, RPCError
+# Run as a script under `python3 -I`, which leaves the script's own directory
+# off sys.path; add it explicitly so the sibling modules resolve.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from rpc import RPC, DEFAULT_CLIENT_ID, RPCError, _obj  # noqa: E402
+from safefs import open_private_dir, read_private_file, write_file_atomic  # noqa: E402
 
 SCOPES = ["rpc", "rpc.voice.read"]
 
@@ -33,47 +37,62 @@ STREAMKIT_EXCHANGE = "https://streamkit.discord.com/overlay/token"
 DISCORD_EXCHANGE = "https://discord.com/api/oauth2/token"
 APP_REDIRECT = "http://localhost"
 
+# The token-exchange reply is a few hundred bytes; don't buffer more than this.
+MAX_EXCHANGE_REPLY = 64 * 1024
 
-def state_dir():
-    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
-    path = os.path.join(base, "omarchy-discord-vc")
-    os.makedirs(path, mode=0o700, exist_ok=True)
-    # makedirs' mode only applies when it creates the directory; tighten one
-    # that already existed with looser permissions.
-    os.chmod(path, stat.S_IRWXU)
-    return path
+TOKEN_NAME = "token.json"
+# A token file is ~100 bytes; anything near this is not one of ours.
+MAX_TOKEN_BYTES = 16 * 1024
 
 
-def token_path():
-    return os.path.join(state_dir(), "token.json")
+def state_dir_path():
+    base = os.environ.get("XDG_STATE_HOME") or ""
+    # XDG says a relative value is invalid and must be ignored.
+    if not os.path.isabs(base):
+        base = os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "omarchy-discord-vc")
 
 
 def load_token():
+    """The cached access token, or None.
+
+    The directory is reached through open_private_dir() and the file read
+    relative to that descriptor, so neither a symlinked state path nor a
+    swapped token file can make this read anything but our own 0600 file.
+    Any refusal reads as "not authorized", which prompts a fresh `auth`.
+    """
     try:
-        with open(token_path(), encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
+        dfd = open_private_dir(state_dir_path())
+    except OSError:
+        return None
+    try:
+        raw = read_private_file(dfd, TOKEN_NAME, MAX_TOKEN_BYTES)
+    except OSError:
+        return None
+    finally:
+        os.close(dfd)
+    if raw is None:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
         return None
     token = data.get("access_token")
     return token if isinstance(token, str) and token else None
 
 
 def save_token(token, client_id):
-    path = token_path()
-    tmp = path + ".tmp"
-    # Create the file 0600 from the start rather than chmod-ing after the
-    # write, so the token never exists in a file with umask permissions.
-    # O_NOFOLLOW refuses to write through a symlink left at the temp path.
+    """Write the token 0600 into the 0700 state directory, atomically."""
+    path = state_dir_path()
+    body = json.dumps({"access_token": token, "client_id": client_id})
+    dfd = open_private_dir(path)
     try:
-        os.unlink(tmp)
-    except FileNotFoundError:
-        pass
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                 stat.S_IRUSR | stat.S_IWUSR)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump({"access_token": token, "client_id": client_id}, fh)
-    os.replace(tmp, path)
-    return path
+        write_file_atomic(dfd, TOKEN_NAME, body.encode("utf-8"), mode=0o600)
+    finally:
+        os.close(dfd)
+    return os.path.join(path, TOKEN_NAME)
 
 
 def _post_json(url, payload, headers=None):
@@ -82,7 +101,7 @@ def _post_json(url, payload, headers=None):
     merged.update(headers or {})
     req = urllib.request.Request(url, data=body, headers=merged)
     with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        return _read_reply(resp)
 
 
 def _post_form(url, fields):
@@ -92,7 +111,22 @@ def _post_form(url, fields):
         url, data=body,
         headers={"Content-Type": "application/x-www-form-urlencoded"})
     with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        return _read_reply(resp)
+
+
+def _str_or(value, default="unknown"):
+    return value if isinstance(value, str) and value else default
+
+
+def _read_reply(resp):
+    """Parse a bounded JSON object from an exchange reply."""
+    raw = resp.read(MAX_EXCHANGE_REPLY + 1)
+    if len(raw) > MAX_EXCHANGE_REPLY:
+        raise RPCError("token exchange reply is unexpectedly large")
+    try:
+        return _obj(json.loads(raw.decode("utf-8")))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise RPCError(f"token exchange reply is not JSON: {exc}") from exc
 
 
 def exchange_streamkit(code):
@@ -108,10 +142,10 @@ def exchange_streamkit(code):
         "Accept": "application/json",
     })
     token = data.get("access_token")
-    if not token:
+    if not isinstance(token, str) or not token:
         raise RPCError(
             "streamkit exchange returned no token "
-            f"(reply: {data}). Authorization codes expire within about a "
+            f"(reply keys: {sorted(data)}). Authorization codes expire within about a "
             "minute -- run the command again and approve promptly.")
     return token
 
@@ -125,8 +159,9 @@ def exchange_app(code, client_id, client_secret):
         "redirect_uri": APP_REDIRECT,
     })
     token = data.get("access_token")
-    if not token:
-        raise RPCError(f"discord exchange returned no token: {data}")
+    if not isinstance(token, str) or not token:
+        raise RPCError("discord exchange returned no token "
+                       f"(error: {_str_or(data.get('error'))})")
     return token
 
 
@@ -162,8 +197,8 @@ def authorize(mode="streamkit"):
                        {"client_id": client_id, "scopes": SCOPES},
                        timeout=300.0)
     code = data.get("code")
-    if not code:
-        raise RPCError(f"no authorization code returned: {data}")
+    if not isinstance(code, str) or not code:
+        raise RPCError("no authorization code returned")
 
     token = (exchange_app(code, client_id, client_secret) if mode == "app"
              else exchange_streamkit(code))
